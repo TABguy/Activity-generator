@@ -29,6 +29,28 @@ set -euo pipefail
 # Emplacement des scripts (par défaut : le dossier de ce script)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --- Environnement virtuel Python -------------------------------------------
+# Chemin du venv à activer (surchargeable par variable d'env VENV).
+# Mets VENV= (vide) pour utiliser le python3 du système sans venv.
+VENV="${VENV-/scratch/ui11_2/tcosmo/fastAPI-project/.venv}"
+
+if [[ -n "$VENV" ]]; then
+    ACTIVATE="$VENV/bin/activate"
+    if [[ ! -f "$ACTIVATE" ]]; then
+        echo "[✗] Venv introuvable : $ACTIVATE" >&2
+        echo "    Corrige la variable VENV ou mets-la à \"\" pour t'en passer." >&2
+        exit 1
+    fi
+    # 'activate' référence des variables non définies (ex : PS1, PYTHONHOME) ;
+    # on désactive temporairement set -u le temps du sourcing pour éviter un
+    # plantage sous 'set -euo pipefail'.
+    set +u
+    # shellcheck disable=SC1090
+    source "$ACTIVATE"
+    set -u
+    echo "[i] Venv activé : $VENV"
+fi
+
 # Fichiers intermédiaires
 LOGS="${LOGS:-$SCRIPT_DIR/logs.txt}"
 VERITE="${VERITE:-$SCRIPT_DIR/verite.jsonl}"
