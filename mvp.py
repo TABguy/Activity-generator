@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 # et choisis en conséquence.
 #   "bsd"  -> "Jul  7 14:32:05"          (syslog traditionnel)
 #   "iso"  -> "2026-07-07T14:32:05+02:00" (rsyslog / journald moderne)
-TIMESTAMP_FORMAT = "bsd"
+TIMESTAMP_FORMAT = "iso"
 
 # Nom(s) de machine surveillée(s). L'identité de la cible est un signal.
 HOSTNAMES = ["web-server-prod", "db-server-prod", "vm-app-01"]
