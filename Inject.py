@@ -1,385 +1,187 @@
 #!/usr/bin/env python3
 """
-Générateur de logs auth.log réalistes pour évaluation de triage.
+Injecteur de logs synthétiques dans Wazuh, avec REJEU TEMPOREL.
 
-Principe : on ne génère pas des lignes isolées au hasard, mais des SÉQUENCES
-cohérentes produites par des "profils d'activité" (personas). Chaque profil a
-une identité stable (ses IP, ses utilisateurs, ses horaires) et un comportement
-propre. C'est cette cohérence qui crée le réalisme — et les cas ambigus.
+Problème résolu
+---------------
+mvp.py génère des lignes horodatées dans le passé (sur N jours). Or Wazuh, en
+flux réel, corrèle sur une FENÊTRE DE TEMPS courante (le <timeframe> des règles
+composites, ex : la 5763 "brute force" qui regroupe plusieurs échecs proches).
+Si on fait un simple `cat logs.txt >> fichier_suivi`, deux problèmes :
+  - les timestamps sont vieux → la corrélation peut ne pas se déclencher ;
+  - tout arrive sur la même milliseconde → on écrase la notion de séquence.
 
-Chaque log généré porte sa VÉRITÉ TERRAIN par construction : le profil qui l'a
-produit détermine si c'est benin / malveillant / ambigu. On produit donc DEUX
-fichiers :
-  - logs.txt        : les lignes de log (à injecter dans Wazuh)
-  - verite.jsonl    : pour chaque ligne, son étiquette et sa justification
-                      (le "corrigé", à ne PAS donner au LLM)
+Ce script NE rejoue PAS les vieux timestamps. Il :
+  1. regroupe les lignes par session_id (fourni par mvp.py) ;
+  2. calcule les écarts RELATIFS entre lignes d'une même session ;
+  3. ré-horodate chaque ligne à l'instant de l'injection (now) ;
+  4. respecte les délais intra-session (pour que la corrélation se déclenche),
+     avec une petite pause fixe entre sessions (au lieu des heures/jours réels).
 
-MVP : format auth.log (SSH + sudo), 4 profils. Conçu pour être étendu.
+Ainsi une force brute reste une rafale serrée (→ 5763), mais l'injection totale
+prend quelques minutes, pas 7 jours.
+
+Le fichier cible doit être un fichier DÉDIÉ, déjà suivi par le manager
+(bloc <localfile> avec <log_format>syslog</log_format>), monté en bind mount.
+On APPEND ligne à ligne : le manager n'analyse que ce qui arrive après le
+démarrage du suivi.
 """
 
 import json
-import random
+import time
 import argparse
 from datetime import datetime, timedelta
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-
-# Format d'horodatage. Wazuh décode les deux, MAIS il faut que ça corresponde
-# à ce que produit TON vrai auth.log. Vérifie une ligne de ton fichier réel
-# et choisis en conséquence.
-#   "bsd"  -> "Jul  7 14:32:05"          (syslog traditionnel)
-#   "iso"  -> "2026-07-07T14:32:05+02:00" (rsyslog / journald moderne)
-TIMESTAMP_FORMAT = "bsd"
-
-# Nom(s) de machine surveillée(s). L'identité de la cible est un signal.
-HOSTNAMES = ["web-server-prod", "db-server-prod", "vm-app-01"]
-
-# --- Identités stables par profil (la cohérence = le réalisme) ---
-
-# L'administrateur légitime : IP internes connues, comptes d'admin réels.
-ADMIN_IPS = ["10.0.1.10", "10.0.1.11"]
-ADMIN_USERS = ["thomas", "admin-sys"]
-
-# Les utilisateurs normaux : IP internes, comptes nominatifs.
-USER_IPS = ["10.0.2.34", "10.0.2.35", "10.0.2.36", "10.0.2.51"]
-NORMAL_USERS = ["camille", "leo", "sarah", "yanis", "marie"]
-
-# Le scanner de vulnérabilités interne : une IP interne dédiée, connue.
-SCANNER_IP = "10.0.9.5"
-
-# Les attaquants externes : IP publiques (motif d'attaque).
-ATTACKER_IPS = ["45.83.192.44", "185.220.101.7", "193.106.191.22"]
-
-# Comptes souvent visés par les attaques automatisées.
-ATTACKED_USERS = ["root", "admin", "test", "oracle", "postgres", "ubuntu"]
-
-# Heures ouvrées (pour rendre les horaires réalistes).
-WORK_HOURS = range(8, 19)
+# Formats de timestamp reconnus en tête de ligne (doit matcher mvp.py).
+FMT_ISO = "%Y-%m-%dT%H:%M:%S"   # ex : 2026-06-30T03:31:00+02:00 (on ignore le TZ au parsing)
+FMT_BSD = "%b %d %H:%M:%S"      # ex : Jun 30 03:31:00
 
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
-def format_timestamp(dt):
-    """Formate un datetime selon TIMESTAMP_FORMAT."""
-    if TIMESTAMP_FORMAT == "iso":
-        # +02:00 : ajuste selon ton fuseau si besoin
-        return dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
-    # BSD : le jour est sur 2 caractères, espace de tête si < 10
-    return dt.strftime("%b %e %H:%M:%S").replace("  ", " ")  # normalise l'espace
-
-
-def ligne_ssh_echec(dt, host, user, srcip, port, utilisateur_valide=True):
-    """Ligne d'échec d'authentification SSH.
-    utilisateur_valide=False -> 'invalid user' (compte inexistant, typique des scans)."""
-    pid = random.randint(1000, 65000)
-    ts = format_timestamp(dt)
-    if utilisateur_valide:
-        msg = f"Failed password for {user} from {srcip} port {port} ssh2"
-    else:
-        msg = f"Failed password for invalid user {user} from {srcip} port {port} ssh2"
-    return f"{ts} {host} sshd[{pid}]: {msg}"
+def parse_timestamp(ligne):
+    """Extrait le datetime en tête de ligne. Retourne None si non parsable.
+    Sert UNIQUEMENT à calculer les deltas intra-session, pas à réinjecter."""
+    # ISO : les 19 premiers caractères (YYYY-MM-DDTHH:MM:SS)
+    try:
+        return datetime.strptime(ligne[:19], FMT_ISO)
+    except (ValueError, IndexError):
+        pass
+    # BSD : les 15 premiers caractères (Mon DD HH:MM:SS)
+    try:
+        # strptime BSD n'a pas d'année → on met une année neutre, seul le delta compte
+        return datetime.strptime(ligne[:15].strip(), FMT_BSD)
+    except (ValueError, IndexError):
+        return None
 
 
-def ligne_ssh_succes(dt, host, user, srcip, port):
-    """Ligne de connexion SSH réussie."""
-    pid = random.randint(1000, 65000)
-    ts = format_timestamp(dt)
-    return f"{ts} {host} sshd[{pid}]: Accepted password for {user} from {srcip} port {port} ssh2"
+def rehorodater(ligne, ts_ancien, maintenant, fmt):
+    """Remplace le timestamp en tête de ligne par 'maintenant'.
+    Le corps de la ligne (host, sshd[pid], message) est conservé tel quel."""
+    if fmt == "iso":
+        nouveau_ts = maintenant.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+        reste = ligne[len("2026-06-30T03:31:00+02:00"):]
+        # Plus robuste : on coupe après le premier espace (le TS ISO n'a pas d'espace)
+        reste = ligne.split(" ", 1)[1] if " " in ligne else ""
+        return f"{nouveau_ts} {reste}"
+    else:  # bsd
+        nouveau_ts = maintenant.strftime("%b %e %H:%M:%S").replace("  ", " ")
+        # Le TS BSD occupe 3 champs (mois, jour, heure) → on saute 3 espaces
+        parts = ligne.split(" ", 3)
+        reste = parts[3] if len(parts) > 3 else ""
+        return f"{nouveau_ts} {reste}"
 
 
-def ligne_sudo(dt, host, user, commande):
-    """Ligne d'usage de sudo (élévation de privilèges)."""
-    ts = format_timestamp(dt)
-    return f"{ts} {host} sudo:   {user} : TTY=pts/0 ; PWD=/home/{user} ; USER=root ; COMMAND={commande}"
+def charger_sessions(fichier_verite):
+    """Lit verite.jsonl et regroupe les lignes par session_id, en préservant
+    l'ordre chronologique d'origine à l'intérieur de chaque session."""
+    sessions = {}  # session_id -> liste de dicts {ligne, ts, ...}
+    with open(fichier_verite) as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            rec = json.loads(raw)
+            sid = rec.get("session_id")
+            if sid is None:
+                # Compat : ancien verite.jsonl sans session_id → 1 ligne = 1 session
+                sid = f"orphan-{len(sessions)}"
+            rec["_ts"] = parse_timestamp(rec["ligne"])
+            sessions.setdefault(sid, []).append(rec)
+    # Trier chaque session par timestamp d'origine (sécurité)
+    for sid in sessions:
+        sessions[sid].sort(key=lambda r: r["_ts"] or datetime.min)
+    return sessions
 
 
-def evenement(ligne, profil, verite, raison):
-    """Emballe une ligne avec sa vérité terrain (étiquetage par construction).
-    'verite' ∈ {'benin', 'malveillant', 'ambigu'}."""
-    return {"ligne": ligne, "profil": profil, "verite": verite, "raison": raison}
+def deltas_intra_session(records, delai_max, facteur):
+    """Pour une session, calcule le délai d'attente AVANT chaque ligne.
+    La 1re ligne : 0. Les suivantes : (ts[i] - ts[i-1]) plafonné et accéléré."""
+    delais = [0.0]
+    for i in range(1, len(records)):
+        t_prev, t_cur = records[i - 1]["_ts"], records[i]["_ts"]
+        if t_prev is None or t_cur is None:
+            d = 1.0  # fallback si timestamp illisible
+        else:
+            d = (t_cur - t_prev).total_seconds()
+            if d < 0:
+                d = 0.0
+        d = min(d, delai_max) / facteur
+        delais.append(d)
+    return delais
 
 
-def heure_ouvree(base_day):
-    """Un datetime aléatoire pendant les heures ouvrées du jour donné."""
-    h = random.choice(list(WORK_HOURS))
-    return base_day.replace(hour=h, minute=random.randint(0, 59),
-                            second=random.randint(0, 59))
+def injecter(fichier_verite, fichier_cible, fmt, delai_max, facteur,
+             pause_session, dry_run):
+    sessions = charger_sessions(fichier_verite)
+    # Ordonner les sessions par timestamp de leur 1re ligne (ordre naturel)
+    ordre = sorted(sessions.items(),
+                   key=lambda kv: kv[1][0]["_ts"] or datetime.min)
 
+    total_lignes = sum(len(recs) for _, recs in ordre)
+    print(f"[i] {len(ordre)} sessions, {total_lignes} lignes à injecter.")
+    print(f"[i] Cible : {fichier_cible}")
+    print(f"[i] Mode  : rafale intra-session (délai max {delai_max}s, "
+          f"facteur {facteur}x), pause inter-session {pause_session}s.")
+    if dry_run:
+        print("[i] DRY-RUN : rien n'est écrit, on affiche seulement le plan.\n")
 
-# ---------------------------------------------------------------------------
-# PROFILS D'ACTIVITÉ
-# Chaque profil retourne une liste d'événements (ligne + vérité terrain).
-# ---------------------------------------------------------------------------
+    n = 0
+    # Horodatage LOGIQUE : part de now() au démarrage et avance des délais
+    # rejoués. Ainsi le timestamp écrit progresse ligne à ligne même quand
+    # deux lignes tombent dans la même seconde réelle, et le dry-run montre
+    # un temps réaliste. En injection réelle il colle au temps qui passe.
+    horloge = datetime.now()
+    # 'a' = append : indispensable, le manager ne lit que ce qui arrive après
+    f_out = None if dry_run else open(fichier_cible, "a")
+    try:
+        for idx, (sid, records) in enumerate(ordre):
+            delais = deltas_intra_session(records, delai_max, facteur)
+            profil = records[0].get("profil", "?")
+            verite = records[0].get("verite", "?")
+            print(f"--- session {sid} [{profil}/{verite}] "
+                  f"({len(records)} lignes) ---")
+            for rec, attente in zip(records, delais):
+                if attente > 0 and not dry_run:
+                    time.sleep(attente)
+                # Avancer l'horloge logique du délai rejoué
+                horloge = horloge + timedelta(seconds=attente)
+                nouvelle = rehorodater(rec["ligne"], rec["_ts"], horloge, fmt)
+                n += 1
+                if dry_run:
+                    print(f"  [+{attente:5.1f}s] {nouvelle}")
+                else:
+                    f_out.write(nouvelle + "\n")
+                    f_out.flush()  # forcer l'écriture pour que Wazuh voie tout de suite
+            # Pause entre sessions (sauf après la dernière)
+            if idx < len(ordre) - 1:
+                horloge = horloge + timedelta(seconds=pause_session)
+                if not dry_run:
+                    time.sleep(pause_session)
+    finally:
+        if f_out:
+            f_out.close()
 
-def profil_admin_legitime(base_day):
-    """BÉNIN. L'admin se connecte en root depuis une IP interne connue, en
-    heures ouvrées, et lance des commandes sudo. Génère des alertes Wazuh
-    (connexion root, sudo) mais c'est parfaitement légitime : faux positif type."""
-    events = []
-    host = random.choice(HOSTNAMES)
-    ip = random.choice(ADMIN_IPS)
-    user = random.choice(ADMIN_USERS)
-    dt = heure_ouvree(base_day)
+    print(f"\n[✓] {n} lignes injectées dans {fichier_cible}"
+          if not dry_run else f"\n[✓] DRY-RUN terminé ({n} lignes simulées).")
 
-    # Parfois une faute de frappe avant de réussir (très banal)
-    if random.random() < 0.3:
-        events.append(evenement(
-            ligne_ssh_echec(dt, host, user, ip, random.randint(40000, 60000)),
-            "admin_legitime", "benin",
-            "Echec isole d'un admin (faute de frappe) depuis IP interne connue"))
-        dt += timedelta(seconds=random.randint(5, 20))
-
-    events.append(evenement(
-        ligne_ssh_succes(dt, host, user, ip, random.randint(40000, 60000)),
-        "admin_legitime", "benin",
-        "Connexion admin depuis IP interne connue en heures ouvrees"))
-
-    # Quelques commandes sudo (travail d'admin normal)
-    for _ in range(random.randint(1, 3)):
-        dt += timedelta(seconds=random.randint(10, 120))
-        cmd = random.choice(["/usr/bin/apt update", "/bin/systemctl restart nginx",
-                             "/usr/bin/vim /etc/hosts", "/bin/journalctl -xe"])
-        events.append(evenement(
-            ligne_sudo(dt, host, user, cmd),
-            "admin_legitime", "benin",
-            "Commande sudo d'un admin legitime en heures ouvrees"))
-    return events
-
-
-def profil_utilisateur_distrait(base_day):
-    """BÉNIN. Un utilisateur normal rate son mot de passe quelques fois puis
-    réussit. C'est LE faux positif classique : ça ressemble à une petite force
-    brute, mais c'est juste quelqu'un de distrait."""
-    events = []
-    host = random.choice(HOSTNAMES)
-    ip = random.choice(USER_IPS)
-    user = random.choice(NORMAL_USERS)
-    dt = heure_ouvree(base_day)
-
-    nb_echecs = random.randint(2, 4)
-    for _ in range(nb_echecs):
-        events.append(evenement(
-            ligne_ssh_echec(dt, host, user, ip, random.randint(40000, 60000)),
-            "utilisateur_distrait", "benin",
-            f"{nb_echecs} echecs puis succes, meme utilisateur depuis IP interne : distraction"))
-        dt += timedelta(seconds=random.randint(3, 15))
-
-    events.append(evenement(
-        ligne_ssh_succes(dt, host, user, ip, random.randint(40000, 60000)),
-        "utilisateur_distrait", "benin",
-        "Succes apres quelques echecs, meme compte, IP interne : utilisateur legitime"))
-    return events
-
-
-def profil_scanner_interne(base_day):
-    """BÉNIN (mais bruyant). Le scanner de vulnérabilités interne balaie une
-    machine : ça génère plein d'événements qui RESSEMBLENT à de la reconnaissance
-    hostile, mais l'IP source est le scanner interne connu. Gros volume de faux
-    positifs."""
-    events = []
-    host = random.choice(HOSTNAMES)
-    # Le scan tourne souvent la nuit
-    dt = base_day.replace(hour=random.choice([2, 3, 4]),
-                          minute=random.randint(0, 59), second=0)
-
-    # Le scanner tente plein de comptes rapidement
-    for user in random.sample(ATTACKED_USERS, k=random.randint(3, 6)):
-        events.append(evenement(
-            ligne_ssh_echec(dt, host, user, SCANNER_IP, random.randint(40000, 60000),
-                            utilisateur_valide=False),
-            "scanner_interne", "benin",
-            "Balayage du scanner de vulnerabilites interne (IP interne dediee connue)"))
-        dt += timedelta(seconds=random.randint(1, 4))
-    return events
-
-
-def profil_brute_force_reussie(base_day):
-    """MALVEILLANT. Attaque par force brute depuis une IP externe : rafale
-    d'échecs sur des comptes variés, puis un SUCCÈS. C'est le scénario grave :
-    l'attaquant a fini par entrer."""
-    events = []
-    host = random.choice(HOSTNAMES)
-    ip = random.choice(ATTACKER_IPS)
-    # Une attaque peut survenir n'importe quand
-    dt = base_day.replace(hour=random.randint(0, 23),
-                          minute=random.randint(0, 59), second=random.randint(0, 59))
-
-    # Rafale d'échecs sur des comptes variés (souvent invalides)
-    for _ in range(random.randint(8, 20)):
-        user = random.choice(ATTACKED_USERS)
-        events.append(evenement(
-            ligne_ssh_echec(dt, host, user, ip, random.randint(30000, 60000),
-                            utilisateur_valide=(user in ["root", "ubuntu"])),
-            "brute_force_reussie", "malveillant",
-            "Rafale d'echecs sur comptes varies depuis IP externe : force brute"))
-        dt += timedelta(seconds=random.randint(1, 3))
-
-    # Le succès final : l'attaque a abouti
-    events.append(evenement(
-        ligne_ssh_succes(dt, host, "root", ip, random.randint(30000, 60000)),
-        "brute_force_reussie", "malveillant",
-        "SUCCES sur root depuis IP externe apres rafale d'echecs : compromission probable"))
-    return events
-
-
-def profil_cas_ambigu(base_day):
-    """AMBIGU. Série d'échecs suivie d'un succès, MAIS depuis une IP interne
-    inhabituelle (ni admin connu, ni scanner). Est-ce un utilisateur qui a
-    galéré, ou un mouvement latéral interne (machine déjà compromise) ? Un
-    analyste humain hésiterait aussi. C'est le coeur du test de discernement."""
-    events = []
-    host = random.choice(HOSTNAMES)
-    # IP interne mais PAS dans les listes connues (admin/scanner)
-    ip = f"10.0.{random.randint(3, 8)}.{random.randint(100, 200)}"
-    user = random.choice(["root"] + NORMAL_USERS)
-    dt = base_day.replace(hour=random.choice([1, 2, 22, 23]),  # heure inhabituelle
-                          minute=random.randint(0, 59), second=random.randint(0, 59))
-
-    for _ in range(random.randint(5, 9)):
-        events.append(evenement(
-            ligne_ssh_echec(dt, host, user, ip, random.randint(40000, 60000)),
-            "cas_ambigu", "ambigu",
-            "Echecs puis succes depuis IP interne INCONNUE a heure inhabituelle : "
-            "mouvement lateral possible OU utilisateur legitime en difficulte"))
-        dt += timedelta(seconds=random.randint(2, 8))
-
-    events.append(evenement(
-        ligne_ssh_succes(dt, host, user, ip, random.randint(40000, 60000)),
-        "cas_ambigu", "ambigu",
-        "Succes final : ambigu (IP interne inconnue, heure creuse, compte sensible)"))
-    return events
-
-
-# ---------------------------------------------------------------------------
-# ORCHESTRATEUR
-# ---------------------------------------------------------------------------
-
-# Proportions réalistes AU NIVEAU SESSION (≈ unité de triage après corrélation
-# Wazuh). Massivement du bénin, comme dans un vrai SOC. (profil, poids).
-#
-# Cible ici : ~92% bénin, ~4% malveillant, ~4% ambigu au niveau session.
-# ATTENTION : au niveau LIGNE, le malveillant paraîtra sur-représenté car la
-# force brute génère beaucoup de lignes par session. C'est normal : Wazuh les
-# corrèlera en peu d'alertes. Le niveau session est le bon repère.
-#
-# Compromis à connaître : plus tu es réaliste (bénin dominant), moins tu as de
-# cas rares. Pour en avoir assez à mesurer, AUGMENTE -n (ex : -n 500 -> ~20
-# sessions malveillantes + ~20 ambiguës). Vise le volume, pas juste la
-# proportion.
-POIDS_PROFILS = [
-    (profil_admin_legitime,       40),
-    (profil_utilisateur_distrait, 35),
-    (profil_scanner_interne,      17),
-    (profil_cas_ambigu,            4),
-    (profil_brute_force_reussie,   4),
-]
-
-
-def generer(nb_sessions, nb_jours=7):
-    """Génère nb_sessions "sessions" (chaque session = une exécution d'un profil,
-    produisant plusieurs lignes) réparties sur nb_jours. Retourne la liste de
-    tous les événements, triés chronologiquement."""
-    profils = [p for p, _ in POIDS_PROFILS]
-    poids = [w for _, w in POIDS_PROFILS]
-
-    debut = datetime.now() - timedelta(days=nb_jours)
-    tous_events = []
-    sessions = []  # trace de chaque session : (profil, verite) — l'unite de triage
-
-    for _ in range(nb_sessions):
-        profil = random.choices(profils, weights=poids, k=1)[0]
-        jour = debut + timedelta(days=random.randint(0, nb_jours - 1))
-        events_session = profil(jour)
-        if events_session:
-            # La vérité de la session = celle de ses événements (homogène par profil)
-            sessions.append((events_session[0]["profil"], events_session[0]["verite"]))
-        tous_events.extend(events_session)
-
-    # Tri chronologique : on relit le timestamp depuis la ligne serait fragile,
-    # donc on trie sur l'ordre de génération par jour est insuffisant.
-    # Ici on trie en re-parsant le timestamp de chaque ligne.
-    def cle_tri(ev):
-        return ev["ligne"][:15] if TIMESTAMP_FORMAT == "bsd" else ev["ligne"][:19]
-
-    tous_events.sort(key=cle_tri)
-    return tous_events, sessions
-
-
-def ecrire_sorties(events, fichier_logs, fichier_verite):
-    """Écrit les deux fichiers : les logs (pour Wazuh) et la vérité terrain."""
-    with open(fichier_logs, "w") as f_log, open(fichier_verite, "w") as f_ver:
-        for ev in events:
-            f_log.write(ev["ligne"] + "\n")
-            # La vérité est indexée par la ligne exacte : Wazuh renvoie le
-            # 'full_log' dans ses alertes, ce qui permet de faire la jointure.
-            f_ver.write(json.dumps({
-                "ligne": ev["ligne"],
-                "profil": ev["profil"],
-                "verite": ev["verite"],
-                "raison": ev["raison"],
-            }, ensure_ascii=False) + "\n")
-
-
-def afficher_stats(events, sessions):
-    """Affiche la répartition à DEUX niveaux :
-      - SESSION : l'unité de triage (≈ alerte après corrélation Wazuh). C'est
-        le repère réaliste — c'est ici qu'on veut voir le bénin dominer.
-      - LIGNE   : brut, moins parlant (le malveillant y paraît gonflé car la
-        force brute est bavarde). Donné pour information."""
-    from collections import Counter
-
-    # --- Niveau session (le repère réaliste) ---
-    sess_verite = Counter(v for _, v in sessions)
-    sess_profil = Counter(p for p, _ in sessions)
-    total_sess = len(sessions)
-    print(f"\n=== NIVEAU SESSION ({total_sess} sessions ≈ unites de triage) ===")
-    print("Repartition par verite terrain :")
-    for k in ("benin", "malveillant", "ambigu"):
-        v = sess_verite.get(k, 0)
-        print(f"  {k:12} : {v:4} ({100*v/total_sess:.1f}%)")
-    print("Repartition par profil :")
-    for k, v in sess_profil.most_common():
-        print(f"  {k:22} : {v:4}")
-
-    # --- Niveau ligne (pour information) ---
-    ligne_verite = Counter(ev["verite"] for ev in events)
-    total_lignes = len(events)
-    print(f"\n=== NIVEAU LIGNE ({total_lignes} lignes, pour info) ===")
-    for k in ("benin", "malveillant", "ambigu"):
-        v = ligne_verite.get(k, 0)
-        print(f"  {k:12} : {v:5} ({100*v/total_lignes:.1f}%)")
-
-    # --- Garde-fou : assez de cas rares pour mesurer ? ---
-    n_malv = sess_verite.get("malveillant", 0)
-    n_amb = sess_verite.get("ambigu", 0)
-    if n_malv < 10 or n_amb < 10:
-        print(f"\n[!] Peu de cas rares (malveillant={n_malv}, ambigu={n_amb}).")
-        print("    Augmente -n pour une mesure fiable (vise >=15 par classe rare).")
-
-
-# ---------------------------------------------------------------------------
-# POINT D'ENTRÉE
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generateur de logs auth.log realistes")
-    parser.add_argument("-n", "--sessions", type=int, default=100,
-                        help="Nombre de sessions a generer (defaut 100)")
-    parser.add_argument("-j", "--jours", type=int, default=7,
-                        help="Etaler sur N jours (defaut 7)")
-    parser.add_argument("--logs", default="logs.txt", help="Fichier de sortie des logs")
-    parser.add_argument("--verite", default="verite.jsonl", help="Fichier de verite terrain")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(
+        description="Injecte les logs synthétiques dans Wazuh avec rejeu temporel.")
+    p.add_argument("--verite", default="verite.jsonl",
+                   help="Fichier de vérité terrain produit par mvp.py (contient session_id)")
+    p.add_argument("--cible", required=True,
+                   help="Fichier suivi par Wazuh où append les logs (bind mount)")
+    p.add_argument("--format", choices=["iso", "bsd"], default="iso",
+                   help="Format d'horodatage à écrire (doit matcher le <localfile> Wazuh)")
+    p.add_argument("--delai-max", type=float, default=5.0,
+                   help="Plafond du délai intra-session en secondes (défaut 5)")
+    p.add_argument("--facteur", type=float, default=1.0,
+                   help="Facteur d'accélération des délais intra-session (>1 = plus rapide)")
+    p.add_argument("--pause-session", type=float, default=1.5,
+                   help="Pause fixe entre deux sessions en secondes (défaut 1.5)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Affiche le plan d'injection sans rien écrire")
+    args = p.parse_args()
 
-    events, sessions = generer(args.sessions, args.jours)
-    ecrire_sorties(events, args.logs, args.verite)
-    afficher_stats(events, sessions)
-    print(f"\n-> Logs      : {args.logs}")
-    print(f"-> Verite    : {args.verite}")
-    print("\nPROCHAINE ETAPE : valide quelques lignes dans wazuh-logtest AVANT")
-    print("d'en generer des centaines, pour confirmer qu'elles declenchent bien")
-    print("les regles attendues (et que le format d'horodatage correspond au tien).")
+    injecter(args.verite, args.cible, args.format, args.delai_max,
+             args.facteur, args.pause_session, args.dry_run)
