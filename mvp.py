@@ -290,11 +290,17 @@ def generer(nb_sessions, nb_jours=7):
     tous_events = []
     sessions = []  # trace de chaque session : (profil, verite) — l'unite de triage
 
-    for _ in range(nb_sessions):
+    for session_id in range(nb_sessions):
         profil = random.choices(profils, weights=poids, k=1)[0]
         jour = debut + timedelta(days=random.randint(0, nb_jours - 1))
         events_session = profil(jour)
         if events_session:
+            # Marquer chaque événement de sa session AVANT le tri qui va
+            # entrelacer les lignes de sessions différentes. C'est ce qui
+            # permettra à l'injecteur de regrouper une session (ex : une force
+            # brute) pour rejouer ses délais intra-session sans interruption.
+            for ev in events_session:
+                ev["session_id"] = session_id
             # La vérité de la session = celle de ses événements (homogène par profil)
             sessions.append((events_session[0]["profil"], events_session[0]["verite"]))
         tous_events.extend(events_session)
@@ -318,6 +324,7 @@ def ecrire_sorties(events, fichier_logs, fichier_verite):
             # 'full_log' dans ses alertes, ce qui permet de faire la jointure.
             f_ver.write(json.dumps({
                 "ligne": ev["ligne"],
+                "session_id": ev["session_id"],
                 "profil": ev["profil"],
                 "verite": ev["verite"],
                 "raison": ev["raison"],
